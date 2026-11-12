@@ -1,202 +1,253 @@
 import json
-import math
 import os
+import math
 import sys
 from datetime import datetime
 
-def parse_iso8601(s):
-    # Python 3.13 should handle Z suffix, but let's be robust
-    if s.endswith('Z'):
-        s = s[:-1] + '+00:00'
-    return datetime.fromisoformat(s)
+# Constants
+NAMED = [0.5, 0.4, 0.75, 0.90, 0.75, 0.75, 0.65, 0.75, 0.85, 0.7]
+SD = [1.75, 1.75, 1.0, 2.0, 1.75, 1.5, 2.75, 1.25, 4.0, 3.0]
+SHIFT = [0, 2, 0, 2, 5.5, 0, 0, 0, 0, 2]
+PD = 4.0
+VD = 1.25
+PMIN = 0.0035
+TOPK = 25
+GAMMA = 0.08
+HALFLIFE_HOURS = 8
 
-def get_gap_hours(t1, t2):
-    return (t2 - t1).total_seconds() / 3600.0
+def get_dt_hours(t1, t2):
+    return (t1 - t2).total_seconds() / 3600.0
 
-def main():
-    # Setup paths
-    input_dir = os.environ.get('MAKEFUN_INPUT_DIR', '/input/')
-    output_dir = os.environ.get('MAKEFUN_OUTPUT_DIR', '/output/')
+def load_data():
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "input")
+    history_file = os.path.join(input_dir, "history.ndjson")
     
-    # Read history
-    history = []
-    with open(os.path.join(input_dir, 'history.ndjson'), 'r') as f:
+    reads = []
+    with open(history_file, 'r') as f:
         for line in f:
             try:
-                read = json.loads(line)
-                if isinstance(read.get('up_and_coming'), list):
-                    history.append(read)
+                data = json.loads(line)
+                if 'up_and_coming' not in data or not isinstance(data['up_and_coming'], list):
+                    continue
+                
+                # Parse timestamp
+                try:
+                    at = datetime.fromisoformat(data['at'].replace('Z', '+00:00'))
+                except (ValueError, TypeError, KeyError):
+                    continue
+                
+                games = []
+                for row in data['up_and_coming']:
+                    if 'rank' not in row or 'universe_id' not in row:
+                        continue
+                    try:
+                        games.append({
+                            'rank': int(row['rank']),
+                            'universe_id': int(row['universe_id']),
+                            'playing': int(row.get('playing', 0))
+                        })
+                    except ValueError:
+                        continue
+                
+                reads.append({'at': at, 'games': games})
             except json.JSONDecodeError:
                 continue
+    
+    return reads
+
+def compute_velocities(reads):
+    if len(reads) < 2:
+        return {}, {}
+    
+    last_idx = len(reads) - 1
+    last_games = {g['universe_id']: g for g in reads[last_idx]['games']}
+    
+    vr = {uid: 0.0 for uid in last_games}
+    vp = {uid: 0.0 for uid in last_games}
+    
+    # Pre-map games for faster lookup
+    read_games = []
+    for r in reads:
+        read_games.append({g['universe_id']: g for g in r['games']})
+
+    for uid in last_games:
+        # Rank velocity: 2 gaps ending at last_read
+        v_recent = None
+        v_older = None
+        
+        # Gap 1 (most recent): last_idx-1 -> last_idx
+        i = last_idx
+        g_curr = read_games[i].get(uid)
+        g_prev = read_games[i-1].get(uid)
+        if g_curr and g_prev:
+            dt = get_dt_hours(reads[i]['at'], reads[i-1]['at'])
+            if dt > 0:
+                v_recent = (g_curr['rank'] - g_prev['rank']) / dt
+                
+        # Gap 2 (older): last_idx-2 -> last_idx-1
+        if last_idx >= 2:
+            i = last_idx - 1
+            g_curr = read_games[i].get(uid)
+            g_prev = read_games[i-1].get(uid)
+            if g_curr and g_prev:
+                dt = get_dt_hours(reads[i]['at'], reads[i-1]['at'])
+                if dt > 0:
+                    v_older = (g_curr['rank'] - g_prev['rank']) / dt
+        
+        if v_recent is not None and v_older is not None:
+            vr[uid] = max(-4.0, min(4.0, 0.65 * v_recent + 0.35 * v_older))
+        elif v_recent is not None:
+            vr[uid] = max(-4.0, min(4.0, v_recent))
+        elif v_older is not None:
+            vr[uid] = max(-4.0, min(4.0, v_older))
+        else:
+            vr[uid] = 0.0
             
-    # Constants
-    SD = [1.75, 1.75, 1.0, 2.0, 1.75, 1.5, 2.75, 1.25, 4.0, 3.0]
-    SHIFT = [0.0, 2.0, 0.0, 2.0, 5.5, 0.0, 0.0, 0.0, 0.0, 2.0]
-    NAMED = [0.5, 0.4, 0.75, 0.90, 0.75, 0.75, 0.65, 0.75, 0.85, 0.7]
-    P_MIN = 0.0035
-    TOPK = 25
-    VEL_DRIFT = 1.25
-    VEL_CLIP = 4.0
-    PLAY_DRIFT = 4.0
-    MIX_ALPHA = 0.9
-    MIX_WIDE = 1.25
-    CLIMBER_MASS = {1: 0.18, 2: 0.18, 3: 0.15, 4: 0.12, 5: 0.12, 6: 0.06, 7: 0.06, 8: 0.06, 9: 0.06, 10: 0.06}
-    CLIMBER_N = 4
+        # Playing velocity: last 2 gaps ending at last_read
+        play_gaps = []
+        for i in range(last_idx, max(0, last_idx - 2), -1):
+            g_curr = read_games[i].get(uid)
+            g_prev = read_games[i-1].get(uid)
+            
+            if g_curr and g_prev:
+                p_curr = g_curr['playing']
+                p_prev = g_prev['playing']
+                dt = get_dt_hours(reads[i]['at'], reads[i-1]['at'])
+                if dt > 0 and p_curr > 0 and p_prev > 0:
+                    play_gaps.append((math.log(p_curr) - math.log(p_prev)) / dt)
+        
+        if play_gaps:
+            vp[uid] = sum(play_gaps) / len(play_gaps)
+            
+    return vr, vp
 
-    # Last read
-    last_read = history[-1]
-    closing_chart = last_read['up_and_coming']
+def compute_occupancy(reads):
+    if not reads:
+        return {}
     
-    # Process chart games
-    chart_games = {}
-    for row in closing_chart:
-        universe_id = row.get('universe_id')
-        rank = row.get('rank')
-        if universe_id is None or rank is None:
-            continue
-        try:
-            chart_games[int(universe_id)] = {'rank': int(rank), 'playing': row.get('playing', 0)}
-        except ValueError:
-            continue
-
-    # Helpers
-    def get_rank(read, uid):
-        for game in read['up_and_coming']:
-            if game.get('universe_id') == uid:
-                return game.get('rank')
-        return None
-
-    def get_playing(read, uid):
-        for game in read['up_and_coming']:
-            if game.get('universe_id') == uid:
-                return game.get('playing')
-        return None
-
-    # Step 1: Rank Velocity
-    v_ranks = {}
-    N = len(history)
-    for uid in chart_games:
-        v_gaps = []
-        # Need at least 3 reads total to have 2 gaps ending at N-1
-        if N >= 3:
-            # Gaps: N-3 -> N-2, N-2 -> N-1
-            for i in range(N-3, N-1):
-                read_a = history[i]
-                read_b = history[i+1]
-                t1 = parse_iso8601(read_a['at'])
-                t2 = parse_iso8601(read_b['at'])
-                dt = get_gap_hours(t1, t2)
-                
-                r1 = get_rank(read_a, uid)
-                r2 = get_rank(read_b, uid)
-                
-                if r1 is not None and r2 is not None and dt > 0:
-                    v_gaps.append((r2 - r1) / dt)
-        
-        if not v_gaps:
-            v_rank = 0.0
-        elif len(v_gaps) == 1:
-            v_rank = v_gaps[0]
-        else:
-            # 0.65 * recent + 0.35 * older
-            v_recent = v_gaps[1]
-            v_older = v_gaps[0]
-            v_rank = 0.65 * v_recent + 0.35 * v_older
-        
-        v_ranks[uid] = max(-VEL_CLIP, min(VEL_CLIP, v_rank))
-
-    # Step 2: Log Playing Velocity
-    v_plays = {}
-    for uid in chart_games:
-        v_gaps = []
-        if N >= 3:
-            for i in range(N-3, N-1):
-                read_a = history[i]
-                read_b = history[i+1]
-                t1 = parse_iso8601(read_a['at'])
-                t2 = parse_iso8601(read_b['at'])
-                dt = get_gap_hours(t1, t2)
-                
-                p1 = get_playing(read_a, uid)
-                p2 = get_playing(read_b, uid)
-                
-                if p1 is not None and p2 is not None and p1 > 0 and p2 > 0 and dt > 0:
-                    v_gaps.append((math.log(p2) - math.log(p1)) / dt)
-        
-        if not v_gaps:
-            v_plays[uid] = 0.0
-        else:
-            v_plays[uid] = sum(v_gaps) / len(v_gaps)
-
-    # Step 3: Gaussian Mixtures
-    probabilities = {} # (uid, place) -> p
+    t_last = reads[-1]['at']
+    occ = {k: {} for k in range(1, 11)} # place: {uid: weight_sum}
     
-    def phi(x):
-        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
+    for r in reads:
+        age = get_dt_hours(t_last, r['at'])
+        weight = 2 ** (-age / HALFLIFE_HOURS)
+        
+        for g in r['games']:
+            k = g['rank']
+            if 1 <= k <= 10:
+                uid = g['universe_id']
+                occ[k][uid] = occ[k].get(uid, 0.0) + weight
+                
+    # Normalize and keep top 10 per place
+    final_occ = {k: {} for k in range(1, 11)}
     for k in range(1, 11):
-        place_raw = []
-        for uid, data in chart_games.items():
-            r = data['rank']
-            c = r + v_ranks[uid] * VEL_DRIFT - v_plays[uid] * PLAY_DRIFT + SHIFT[k-1]
+        total_w = sum(occ[k].values())
+        if total_w > 0:
+            # Sorted by weight descending
+            sorted_uids = sorted(occ[k].items(), key=lambda x: x[1], reverse=True)
+            for uid, w in sorted_uids[:10]:
+                final_occ[k][uid] = w / total_w
+    return final_occ
+
+def phi(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def main():
+    reads = load_data()
+    if not reads:
+        return
+    
+    vr, vp = compute_velocities(reads)
+    occ = compute_occupancy(reads)
+    
+    last_read = reads[-1]
+    
+    # Gaussian mixture
+    probs = [] # list of {"universe_id": uid, "place": k, "p": prob}
+    
+    for k in range(1, 11):
+        place_probs = {}
+        for g in last_read['games']:
+            uid = g['universe_id']
+            rank = g['rank']
+            
+            center = rank + vr.get(uid, 0.0)*VD - vp.get(uid, 0.0)*PD + SHIFT[k-1]
             
             # Narrow
             sd = SD[k-1]
-            p_n = phi((k + 0.5 - c) / sd) - phi((k - 0.5 - c) / sd)
+            p_narrow = phi((k+0.5-center)/sd) - phi((k-0.5-center)/sd)
             
             # Wide
-            sd_w = SD[k-1] * MIX_WIDE
-            p_w = phi((k + 0.5 - c) / sd_w) - phi((k - 0.5 - c) / sd_w)
+            sd_wide = sd * 1.25
+            p_wide = phi((k+0.5-center)/sd_wide) - phi((k-0.5-center)/sd_wide)
             
-            p = MIX_ALPHA * p_n + (1 - MIX_ALPHA) * p_w
-            place_raw.append((uid, p))
+            p = 0.9 * p_narrow + 0.1 * p_wide
             
-        # Top 25
-        place_raw.sort(key=lambda x: x[1], reverse=True)
-        top25 = place_raw[:TOPK]
-        sum_p = sum(x[1] for x in top25)
+            # Add occupancy prior
+            p += GAMMA * occ[k].get(uid, 0.0)
+            
+            place_probs[uid] = p
+            
+        # Keep top TOPK
+        sorted_games = sorted(place_probs.items(), key=lambda x: x[1], reverse=True)
+        top_k = sorted_games[:TOPK]
         
-        if sum_p > 0:
-            for uid, p in top25:
-                probabilities[(uid, k)] = p * NAMED[k-1] / sum_p
+        total_p = sum(p for _, p in top_k)
+        if total_p > 0:
+            for uid, p in top_k:
+                probs.append({"universe_id": uid, "place": k, "p": p * NAMED[k-1] / total_p})
 
-    # Step 4: Climber Bonus
-    climbers = sorted(chart_games.keys(), key=lambda uid: v_plays[uid], reverse=True)[:CLIMBER_N]
-    climber_weights = {uid: max(v_plays[uid], 0.0)**2 for uid in climbers}
-    W = sum(climber_weights.values())
+    # Climber bonus
+    climbers = sorted([g for g in last_read['games'] if vp.get(g['universe_id'], 0.0) > 0], 
+                      key=lambda x: vp.get(x['universe_id'], 0.0), reverse=True)[:4]
     
-    if W > 0:
+    if climbers:
+        mass = {1: 0.18, 2: 0.18, 3: 0.15, 4: 0.12, 5: 0.12, 6: 0.06, 7: 0.06, 8: 0.06, 9: 0.06, 10: 0.06}
+        climber_weights = {g['universe_id']: max(vp.get(g['universe_id'], 0.0), 0)**2 for g in climbers}
+        total_cw = sum(climber_weights.values())
+        
+        # Merge duplicates
+        merged_probs = {} # (uid, place) -> p
+        for row in probs:
+            merged_probs[(row['universe_id'], row['place'])] = merged_probs.get((row['universe_id'], row['place']), 0) + row['p']
+            
+        # Apply bonus
         for k in range(1, 11):
-            mass = CLIMBER_MASS[k]
-            # Multiply existing by (1 - mass)
-            for (uid, place), p in list(probabilities.items()):
+            m = mass[k]
+            
+            # Shrink existing probabilities for place k
+            for (uid, place), p in list(merged_probs.items()):
                 if place == k:
-                    probabilities[(uid, place)] = p * (1 - mass)
+                    merged_probs[(uid, place)] = p * (1.0 - m)
             
-            # Add climbers
-            for uid in climbers:
-                w = climber_weights[uid]
-                if w > 0:
-                    p = mass * w / W
-                    probabilities[(uid, k)] = probabilities.get((uid, k), 0) + p
+            # Now add the bonus mass
+            for uid in climber_weights:
+                bonus = (climber_weights[uid] / total_cw) * m
+                merged_probs[(uid, k)] = merged_probs.get((uid, k), 0) + bonus
+                
+        # Drop and reformat
+        final_probs = []
+        for (uid, k), p in merged_probs.items():
+            if p >= PMIN:
+                final_probs.append({"universe_id": uid, "place": k, "p": round(p, 6)})
+        probs = final_probs
+    else:
+        # Just round
+        for row in probs:
+            row['p'] = round(row['p'], 6)
 
-    # Step 5: Finalize
-    final_probs = []
-    for (uid, place), p in probabilities.items():
-        if p >= P_MIN:
-            final_probs.append({"universe_id": uid, "place": place, "p": round(p, 6)})
-            
+    # Prepare top10
+    top10 = [g['universe_id'] for g in sorted(last_read['games'], key=lambda x: x['rank'])[:10]]
+    
     # Sort
-    final_probs.sort(key=lambda x: (x['place'], -x['p'], x['universe_id']))
+    probs.sort(key=lambda x: (x['place'], -x['p'], x['universe_id']))
     
-    # Top 10
-    top10_ids = [row['universe_id'] for row in sorted(closing_chart, key=lambda x: x['rank'])][:10]
-    
-    # Write output
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "output")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    with open(os.path.join(output_dir, 'forecast.json'), 'w') as f:
-        json.dump({"probabilities": final_probs, "top10": top10_ids}, f)
+        
+    with open(os.path.join(output_dir, "forecast.json"), 'w') as f:
+        json.dump({"probabilities": probs, "top10": top10}, f)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
