@@ -1,17 +1,18 @@
-# Roblox Up-and-Coming Forecaster v6
+# Roblox Up-and-Coming Forecaster v7
 
-This model forecasts Roblox's Up-and-Coming chart.
+This repository contains the entry for the `roblox-up-and-coming-forecast-01` competition.
 
-## Design
-- **Gaussian Mixture**: Two-component mixture (90% narrow, 10% wide with SD x1.25) to model place persistence.
-- **Velocity Drift**: 
-  - Rank velocity (0.65/0.35-weighted mean of last 2 gaps) drift.
-  - Playing-velocity (mean of last 2 gaps) centre drift.
-- **Occupancy Prior**: A recency-weighted place-occupancy table (halflife 8 hours, strength 0.08) added to the raw Gaussian score.
-- **Climber Bonus**: Per-place bonus for top 4 climbers by log-playing velocity.
+## Model Design
+This is a phase-aware forecaster implemented in a single entrypoint (`repo/main.py`).
 
-## How to Run
-```bash
-mkdir -p out
-MAKEFUN_INPUT_DIR=../roblox/input MAKEFUN_OUTPUT_DIR=out python3 repo/main.py
-```
+- **DEV branch**: A place-occupancy frequency table fitted to the practice-window reads (10 reads). It is a dev-board play.
+- **FINAL branch**: The v6 Gaussian rank-persistence forecaster with climber bonuses and recency-weighted occupancy priors. It is a prize-horizon play.
+
+The branch is chosen at runtime based on the `task.json` configuration in the input directory.
+
+## Constants (FINAL branch)
+The model uses parameters from v6 design (Gaussian rank-persistence + playing-velocity climber + occupancy prior GAMMA = 0.08, halflife 8 h).
+
+## How to run
+Set the input and output directories via environment variables:
+`MAKEFUN_INPUT_DIR=<input_dir> MAKEFUN_OUTPUT_DIR=<output_dir> python3 repo/main.py`
